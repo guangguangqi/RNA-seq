@@ -1,0 +1,388 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pandas as pd
+import numpy as np
+from torch_geometric.data import Data
+from torch_geometric.nn import GATConv
+from lifelines.utils import concordance_index
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from torch.optim.lr_scheduler import StepLR
+from scipy.sparse import csr_matrix
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ==========================================
+# Step 1: Data Loading & Cleaning
+# ==========================================
+rna = pd.read_parquet("GNN_Input_RNA_Final.parquet").T
+snp = pd.read_parquet("GNN_Input_SNP_Final.parquet").T
+cnv = pd.read_parquet("GNN_Input_CNV_Final.parquet").T
+pro = pd.read_parquet("GNN_Input_Prot_Final.parquet").T
+
+# Standardize IDs and remove duplicates
+for df in [rna, snp, cnv, pro]:
+    df.index = df.index.astype(str).str[:12].str.strip()
+    df = df[~df.index.duplicated(keep='first')]
+
+clinical_df = pd.read_csv("/home/qiqi5/INT0/CLI/clinical.tsv", sep="\t", low_memory=False)
+clinical_df['time'] = pd.to_numeric(clinical_df['demographic.days_to_death'], errors='coerce').fillna(
+                      pd.to_numeric(clinical_df['diagnoses.days_to_last_follow_up'], errors='coerce'))
+clinical_df['event'] = clinical_df['demographic.vital_status'].map({'Dead': 1, 'Alive': 0})
+clinical_df = clinical_df.drop_duplicates(subset=["cases.submitter_id"]).set_index("cases.submitter_id")
+clinical_df.index = clinical_df.index.astype(str).str.strip()
+
+# Process Clinical Features
+clinical_feats = clinical_df[['demographic.gender', 'demographic.age_at_index']].copy()
+le = LabelEncoder()
+clinical_feats['gender'] = le.fit_transform(clinical_feats['demographic.gender'].fillna('Unknown'))
+scaler = StandardScaler()
+clinical_feats['age'] = scaler.fit_transform(clinical_feats[['demographic.age_at_index']].fillna(0))
+final_feats = clinical_feats[['gender', 'age']].astype(float)
+
+# Unified Indexing
+all_patients = rna.index.union(snp.index).union(cnv.index).union(pro.index).union(clinical_df.index)
+rna = rna.reindex(all_patients, fill_value=0).astype(float)
+snp = snp.reindex(all_patients, fill_value=0).astype(float)
+cnv = cnv.reindex(all_patients, fill_value=0).astype(float)
+pro = pro.reindex(all_patients, fill_value=0).astype(float)
+final_feats = final_feats.reindex(all_patients, fill_value=0).astype(float)
+final_labels = clinical_df.reindex(all_patients)
+
+# Generate Masks
+def get_mask(df):
+    mask = (df.sum(axis=1, numeric_only=True) != 0).astype(float).values
+    return torch.tensor(mask, dtype=torch.float).unsqueeze(1)
+
+m_tensors = {k: get_mask(v).to(device) for k, v in zip(['rna', 'snp', 'cnv', 'pro', 'cli'], [rna, snp, cnv, pro, final_feats])}
+
+# ==========================================
+# Step 2: Architecture Definitions
+# ==========================================
+class MaskedAutoencoder(nn.Module):
+    def __init__(self, dims, latent_dim=128):
+        super().__init__()
+        self.encoders = nn.ModuleDict({
+            k: nn.Sequential(nn.Linear(v, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Linear(512, latent_dim)) 
+            for k, v in dims.items()
+        })
+        self.decoders = nn.ModuleDict({
+            k: nn.Sequential(nn.Linear(latent_dim, 512), nn.ReLU(), nn.Linear(512, v)) 
+            for k, v in dims.items()
+        })
+
+    def forward(self, x_dict, m_dict):
+        embs, recons = {}, {}
+        for k in x_dict:
+            z = self.encoders[k](x_dict[k] * m_dict[k]) 
+            embs[k] = z * m_dict[k]
+            recons[k] = self.decoders[k](embs[k])
+        return embs, recons
+
+class ExpressiveFusion(nn.Module):
+    def __init__(self, latent_dim=128, num_heads=4):
+        super().__init__()
+        self.mha = nn.MultiheadAttention(embed_dim=latent_dim, num_heads=num_heads, batch_first=True)
+        self.ffn = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim * 2), nn.ReLU(), nn.Linear(latent_dim * 2, latent_dim)
+        )
+        self.norm1 = nn.LayerNorm(latent_dim)
+        self.norm2 = nn.LayerNorm(latent_dim)
+        # 🔥 Removed Sigmoid: Softmax needs raw scores (logits) to work best
+        self.gate = nn.Linear(latent_dim, 1) 
+        #####
+
+
+    def forward(self, x_stack, mask_stack):
+        key_padding_mask = (mask_stack.squeeze(-1) == 0)
+        attn_out, _ = self.mha(x_stack, x_stack, x_stack, key_padding_mask=key_padding_mask)
+        x = self.norm1(x_stack + attn_out)
+        x = self.norm2(x + self.ffn(x))
+
+        # ✅ Fix 5: Softmax competition
+        # Shape change: [batch, 5, 1] -> [batch, 5]
+        gate_scores = self.gate(x).squeeze(-1)
+        
+        # Mask missing modalities so they receive 0 weight
+        gate_scores = gate_scores.masked_fill(mask_stack.squeeze(-1) == 0, -1e9)
+        
+        # Convert to probability distribution across the 5 modalities
+        gates = torch.softmax(gate_scores, dim=1).unsqueeze(-1)
+
+        return (x * gates).sum(dim=1)
+
+
+def edge_dropout(edge_index, edge_attr, p=0.1, training=True):
+    if not training: return edge_index, edge_attr
+    mask = torch.rand(edge_index.shape[1], device=edge_index.device) > p
+    return edge_index[:, mask], edge_attr[mask]
+
+
+class SurvivalGNN(nn.Module):
+    def __init__(self, latent_dim=64, dropout_rate=0.4):
+        super().__init__()
+        self.fusion = ExpressiveFusion(latent_dim=128, num_heads=4)
+        
+        # Layer 1: Keep 128 dims (32 * 4 heads)
+        self.conv1 = GATConv(128, 32, heads=4, edge_dim=5) 
+        
+        # ✅ Fix: Reduce Conv2 to 64 dims to prevent "aggressiveness"
+        self.conv2 = GATConv(128, 64, heads=1, edge_dim=5) 
+        
+        self.head = nn.Sequential(
+            # ✅ Fix: Match BatchNorm and Linear to 64
+            nn.BatchNorm1d(64),
+            nn.Linear(64, 1)
+        )
+        self.dropout_rate = dropout_rate
+
+    def forward(self, data):
+        mod_stack = torch.stack([data.rna, data.snp, data.cnv, data.pro, data.cli], dim=1)
+        mask_stack = torch.stack([data.m_rna, data.m_snp, data.m_cnv, data.m_pro, data.m_cli], dim=1)
+        
+        x = self.fusion(mod_stack, mask_stack) # 128-dim
+        
+        ei, ea = edge_dropout(data.edge_index, data.edge_attr, p=0.1, training=self.training)
+        
+        x = F.elu(self.conv1(x, ei, ea))
+        x = F.dropout(x, p=self.dropout_rate, training=self.training)
+        
+        # ⚠️ Residual removed here because 128 != 64
+        x = self.conv2(x, ei, ea) 
+        
+        return self.head(x)
+
+
+
+
+
+
+rna.columns = rna.columns.astype(str).str.split('.').str[0].str.upper()
+
+
+# ==========================================
+# Step 3: Graph Building (Biology-Driven)
+# ==========================================
+import os
+from sklearn.metrics import pairwise_distances
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.neighbors import NearestNeighbors
+
+def normalize_sim(sim):
+    return (sim - np.mean(sim)) / (np.std(sim) + 1e-8)
+
+def build_biological_graph(rna_df, string_df, cnv_df, snp_df, pro_df, top_k=8):
+    # --- 1. STRING Prior (Precompute/Load Logic) ---
+    if os.path.exists("sim_bio_prior.npy"):
+       sim_bio_prior = np.load("sim_bio_prior.npy")
+    else:
+    # Find genes present in both RNA columns AND STRING
+      common = sorted(list(set(string_df['gene1']).intersection(rna_df.columns).intersection(string_df['gene2'])))
+      gene_to_idx = {g: i for i, g in enumerate(common)}
+    
+    # 🔥 FIXED: Filter the dataframe ONCE so row, col, and score have the SAME length
+      string_sub = string_df[
+        string_df['gene1'].isin(common) & 
+        string_df['gene2'].isin(common)
+      ].copy()
+
+    # Create Adjacency with consistent arrays
+      A = csr_matrix(
+        (string_sub['score'].values, 
+         (string_sub['gene1'].map(gene_to_idx).values, 
+          string_sub['gene2'].map(gene_to_idx).values)), 
+        shape=(len(common), len(common))
+      )
+    
+    # Biological Projection (Projecting gene-prior onto patients)
+    # Ensure RNA is aligned to the same 'common' genes
+      X = StandardScaler().fit_transform(rna_df[common])
+      sim_bio_prior = (X @ A) @ X.T
+    
+    # Stability: Log + Normalize
+      sim_bio_prior = np.log1p(np.abs(sim_bio_prior))
+      sim_bio_prior = (sim_bio_prior - sim_bio_prior.mean()) / (sim_bio_prior.std() + 1e-8)
+      np.save("sim_bio_prior.npy", sim_bio_prior) 
+
+    # --- 2. Multi-Channel Similarities ---
+    sim_rna = normalize_sim(cosine_similarity(StandardScaler().fit_transform(rna_df)))
+    sim_cnv = normalize_sim(cosine_similarity(StandardScaler().fit_transform(cnv_df)))
+    sim_pro = normalize_sim(cosine_similarity(StandardScaler().fit_transform(pro_df)))
+    # Jaccard for SNPs (Centered)
+    sim_snp = 1 - pairwise_distances(snp_df.values, metric='jaccard')
+    sim_snp = sim_snp - np.mean(sim_snp)
+
+    # --- 3. Symmetric Topology ---
+    knn = NearestNeighbors(n_neighbors=top_k + 1, metric='cosine')
+    knn.fit(StandardScaler().fit_transform(rna_df))
+    _, indices = knn.kneighbors(StandardScaler().fit_transform(rna_df))
+    
+    edge_index, edge_attr = [], []
+    for i in range(len(rna_df)):
+        for neighbor_idx in indices[i, 1:]:
+            attr = [sim_rna[i, neighbor_idx], sim_cnv[i, neighbor_idx], 
+                    sim_snp[i, neighbor_idx], sim_pro[i, neighbor_idx], 
+                    sim_bio_prior[i, neighbor_idx]]
+            
+            # Add Symmetric Edges (Undirected Graph)
+            edge_index.extend([[i, neighbor_idx], [neighbor_idx, i]])
+            edge_attr.extend([attr, attr])
+            
+    return torch.tensor(edge_index).t().contiguous(), torch.tensor(edge_attr, dtype=torch.float)
+
+# Load STRING PPI with both protein columns mapped
+# ==========================================
+# Step 3: Fixed STRING Loading & Mapping
+# ==========================================
+# 1. Load data
+string_raw = pd.read_csv("9606.protein.links.v12.0.txt.gz", sep=" ")
+aliases = pd.read_csv("9606.protein.aliases.v12.0.txt.gz", sep="\t", compression='gzip')
+
+# Use the specific sources identified in your alias file
+# Primary: Ensembl_HGNC_symbol, Secondary: BioMart_HUGO
+valid_sources = ['Ensembl_HGNC_symbol', 'BioMart_HUGO']
+mask = aliases['source'].isin(valid_sources)
+
+# Create the dictionary: {protein_id: symbol}
+# We use drop_duplicates to ensure 1:1 mapping if a protein has multiple aliases
+mapping_df = aliases[mask].drop_duplicates(subset=['#string_protein_id'], keep='first')
+ensp_to_symbol = mapping_df.set_index('#string_protein_id')['alias'].to_dict()
+
+# Map BOTH protein columns to gene symbols
+string_df = pd.DataFrame({
+    "gene1": string_raw["protein1"].map(ensp_to_symbol),
+    "gene2": string_raw["protein2"].map(ensp_to_symbol),
+    "score": string_raw["combined_score"] / 1000.0
+}).dropna()
+
+print(f"STRING interaction rows after mapping: {len(string_df)}")
+
+# Standardize names for the GNN Graph Builder
+string_df['gene1'] = string_df['gene1'].astype(str).str.upper().str.strip()
+string_df['gene2'] = string_df['gene2'].astype(str).str.upper().str.strip()
+rna.columns = rna.columns.astype(str).str.upper().str.strip()
+
+
+# ==========================================
+# Step 4: Training Setup
+# ==========================================
+def cox_loss(pred, y, event):
+     # Sort by time descending to establish the risk set
+    _, idx = torch.sort(y, descending=True)
+    p_ord, e_ord = pred[idx], event[idx]
+
+    # ✅ Step 3: Numerically Stable Log-Sum-Exp Trick
+    # Subtracting the max value prevents exponential overflow
+    max_val = torch.max(p_ord)
+    # log_risk = log(sum(exp(x - max))) + max
+    log_risk = torch.log(torch.cumsum(torch.exp(p_ord - max_val), dim=0) + 1e-8) + max_val
+    
+    # Negative Partial Log-Likelihood
+    loss = -torch.sum(e_ord * (p_ord - log_risk)) / (torch.sum(e_ord) + 1e-8)
+    return loss
+
+
+input_dims = {'rna': rna.shape[1], 'snp': snp.shape[1], 'cnv': cnv.shape[1], 'pro': pro.shape[1], 'cli': final_feats.shape[1]}
+ae_model = MaskedAutoencoder(input_dims).to(device)
+gnn_model = SurvivalGNN().to(device)
+
+ae_input = {k: torch.tensor(v.values, dtype=torch.float).to(device) for k, v in zip(input_dims.keys(), [rna, snp, cnv, pro, final_feats])}
+
+edge_index, edge_attr = build_biological_graph(rna, string_df, cnv, snp, pro, top_k=5)
+
+data = Data(m_rna=m_tensors['rna'], m_snp=m_tensors['snp'], m_cnv=m_tensors['cnv'], m_pro=m_tensors['pro'], m_cli=m_tensors['cli'], 
+            edge_index=edge_index.to(device), edge_attr=edge_attr.to(device),
+            y=torch.tensor(final_labels['time'].fillna(0).values, dtype=torch.float).to(device), 
+            event=torch.tensor(final_labels['event'].fillna(0).values, dtype=torch.float).to(device))
+
+
+
+valid_idx = np.where(~final_labels['time'].isna())[0]
+train_idx, val_idx = train_test_split(valid_idx, test_size=0.2, random_state=42)
+
+
+# ==========================================
+# Step 5: End-to-End Training Loop
+# ==========================================
+
+best_c, counter, patience = 0, 0, 50
+
+optimizer = torch.optim.Adam(
+    list(ae_model.parameters()) + list(gnn_model.parameters()), 
+    lr=1e-4, 
+    weight_decay=1e-5
+)
+scheduler = StepLR(optimizer, step_size=50, gamma=0.5)
+
+
+for epoch in range(801):
+    # ... (forward pass code) ...
+
+    ae_model.train()
+    gnn_model.train()
+    optimizer.zero_grad()
+
+    # Forward
+    embs, recons = ae_model(ae_input, m_tensors)
+    data.rna, data.snp, data.cnv, data.pro, data.cli = (
+        embs['rna'], embs['snp'], embs['cnv'], embs['pro'], embs['cli']
+    )
+    predictions = gnn_model(data).squeeze()
+    predictions = torch.clamp(predictions, -10, 10) 
+    # Loss
+    ae_loss = sum(F.mse_loss(recons[k] * m_tensors[k], ae_input[k] * m_tensors[k]) for k in ae_input)
+    surv_loss = cox_loss(predictions[train_idx], data.y[train_idx], data.event[train_idx])
+
+    # 🔥 Smooth curriculum
+    warmup = 100
+    alpha = min(0.2, (epoch - warmup) / 200.0)
+
+    surv_loss_scaled = surv_loss / (torch.std(predictions[train_idx]) + 1e-8)
+
+    total_loss = ae_loss + alpha * surv_loss_scaled  
+
+
+    # Backprop
+    total_loss.backward()
+    torch.nn.utils.clip_grad_norm_(ae_model.parameters(), 1.0)
+    torch.nn.utils.clip_grad_norm_(gnn_model.parameters(), 1.0)
+    optimizer.step()
+    scheduler.step()
+
+    if epoch == 100:
+      print(">>> Transitioning to Fine-Tuning: Reducing AE learning rate.")
+    # Give the GNN the full 1e-4, but drop the AE to a tiny 1e-6
+      optimizer = torch.optim.Adam([
+        {'params': gnn_model.parameters(), 'lr': 1e-4},
+        {'params': ae_model.parameters(), 'lr': 1e-6, 'weight_decay': 1e-2} # "Lasso-style" decay
+      ])
+
+    # Eval
+    if epoch % 20 == 0:
+        ae_model.eval()
+        gnn_model.eval() # Ensure dropout is off
+
+        with torch.no_grad():
+            v_embs, _ = ae_model(ae_input, m_tensors)
+            data.rna, data.snp, data.cnv, data.pro, data.cli = (
+                v_embs['rna'], v_embs['snp'], v_embs['cnv'], v_embs['pro'], v_embs['cli']
+            )
+            
+            # GNN is in eval mode, so Dropout is inactive
+            preds_val = gnn_model(data).squeeze()[val_idx].cpu().numpy()
+            c_index = concordance_index(data.y[val_idx].cpu(), -preds_val, data.event[val_idx].cpu())
+
+            print(f"Epoch {epoch:03d} | Total Loss: {total_loss.item():.4f} | Val C: {c_index:.4f}")
+
+            # Only start checking patience after the curriculum has matured (e.g., epoch 150)
+            if c_index > best_c:
+                best_c = c_index
+                counter = 0
+                torch.save({'ae': ae_model.state_dict(), 'gnn': gnn_model.state_dict()}, "best_model.pt")
+            elif epoch > 150: # Only count towards patience after survival signal is dominant
+                counter += 1
+                if counter >= patience:
+                    print(f"Early stopping at epoch {epoch}. Best Val C: {best_c:.4f}")
+                    break
+     
