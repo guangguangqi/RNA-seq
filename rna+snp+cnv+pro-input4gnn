@@ -1,0 +1,66 @@
+import pandas as pd
+import numpy as np
+
+# 1. Load your saved matrices
+rna_matrix = pd.read_csv("/home/qiqi5/INT0/RNA-1000/TCGA-BRCA_RNA_Matrix.csv", index_col=0)
+snp_matrix = pd.read_parquet("/home/qiqi5/INT0/SNP-2000/TCGA-BRCA_SNP_Binary_Matrix.parquet")
+cnv_matrix = pd.read_parquet("/home/qiqi5/INT0/CNV-2000/GNN_Input_CNV_Final.parquet")
+pro_matrix = pd.read_parquet("/home/qiqi5/INT0/PROM-1000/GNN_Input_Prot_Final.parquet")
+
+# --- Step A: Align Patients (Columns) FIRST ---
+# Intersection of all FOUR to find patients with complete multi-omic data
+common_patients = rna_matrix.columns.intersection(snp_matrix.columns) \
+                                    .intersection(cnv_matrix.columns) \
+                                    .intersection(pro_matrix.columns)
+print(f"Common patients found across all 4: {len(common_patients)}")
+
+# Subset and align the order of patients exactly
+rna_matrix = rna_matrix[common_patients]
+snp_matrix = snp_matrix[common_patients]
+cnv_matrix = cnv_matrix[common_patients]
+pro_matrix = pro_matrix[common_patients]
+
+# --- Step B: Initial Gene Alignment ---
+# Find genes present in all four datasets before filtering
+common_genes = rna_matrix.index.intersection(snp_matrix.index) \
+                               .intersection(cnv_matrix.index) \
+                               .intersection(pro_matrix.index)
+rna_matrix = rna_matrix.loc[common_genes]
+snp_matrix = snp_matrix.loc[common_genes]
+cnv_matrix = cnv_matrix.loc[common_genes]
+pro_matrix = pro_matrix.loc[common_genes]
+
+# --- Step C: Filter Low-Quality RNA Genes ---
+rna_filter_mask = (rna_matrix > 0).mean(axis=1) > 0.10
+rna_matrix = rna_matrix.loc[rna_filter_mask]
+
+# --- Step D: Remove Ultra-Rare Mutations ---
+snp_filter_mask = snp_matrix.mean(axis=1) > 0.01
+snp_matrix = snp_matrix.loc[snp_filter_mask]
+
+# --- Step E: Final Synchronized Alignment ---
+# Ensure rows match perfectly after separate quality filters
+# We intersect the high-quality RNA/SNP indices
+final_genes = rna_matrix.index.intersection(snp_matrix.index)
+
+rna_final = rna_matrix.loc[final_genes]
+snp_final = snp_matrix.loc[final_genes]
+cnv_final = cnv_matrix.loc[final_genes].fillna(0)
+pro_final = pro_matrix.loc[final_genes].fillna(0)
+
+# --- Step F: Normalize RNA (Log + Z-score) ---
+rna_log = np.log2(rna_final + 1)
+rna_norm = rna_log.apply(lambda x: (x - x.mean()) / (x.std() + 1e-8), axis=1)
+
+# Optional: Normalize Proteomics if not already scaled
+# pro_final = pro_final.apply(lambda x: (x - x.mean()) / (x.std() + 1e-8), axis=1)
+
+# --- Step G: Save for GNN ---
+rna_norm.to_parquet("GNN_Input_RNA_Final.parquet")
+snp_final.to_parquet("GNN_Input_SNP_Final.parquet")
+cnv_final.to_parquet("GNN_Input_CNV_Final.parquet")
+pro_final.to_parquet("GNN_Input_Prot_Final.parquet")
+
+print(f"Final dataset dimensions: {len(final_genes)} genes x {len(common_patients)} patients")
+print("Multi-modal alignment complete for 4 modalities.")
+
